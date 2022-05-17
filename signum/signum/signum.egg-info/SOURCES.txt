@@ -1,9 +1,0 @@
-set_up.py
-signum/__init__.py
-signum/signum.py
-signum/test_signum.py
-signum/test_signum_Opt.py
-signum.egg-info/PKG-INFO
-signum.egg-info/SOURCES.txt
-signum.egg-info/dependency_links.txt
-signum.egg-info/top_level.txt
