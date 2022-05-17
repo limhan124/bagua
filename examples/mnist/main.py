@@ -252,6 +252,13 @@ def main():
         algorithm = async_model_average.AsyncModelAverageAlgorithm(
             sync_interval_ms=args.async_sync_interval,
         )
+    elif args.algorithm == "signum":
+        from signum import SignumOptimizer, SignumAlgorithm
+
+        optimizer = SignumOptimizer(
+            model.parameters(), lr=args.lr
+        )
+        algorithm = SignumAlgorithm(optimizer)
     else:
         raise NotImplementedError
 
