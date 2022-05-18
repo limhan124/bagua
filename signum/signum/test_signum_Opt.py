@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .signum import SignumOptimizer
+from signum import SignumOptimizer
 
 
 class Net(nn.Module):

@@ -5,7 +5,7 @@ import logging
 import torch.nn.functional as F
 import torch.optim as optim
 import torch
-from .signum import SignumOptimizer, SignumAlgorithm
+from signum import SignumOptimizer, SignumAlgorithm
 
 USE_SIGNUM = True
 
@@ -19,8 +19,8 @@ def main():
     model = torch.nn.Sequential(torch.nn.Linear(10000, 10000), torch.nn.Linear(10000, 1)).cuda()
 
     if USE_SIGNUM:
-        signum_optimizer = SignumOptimizer(model.parameters(), lr=0.01)
-        algorithm = SignumAlgorithm(signum_optimizer, False)
+        optimizer = SignumOptimizer(model.parameters(), lr=0.00001)
+        algorithm = SignumAlgorithm(optimizer, False)
     else:
         optimizer = optim.SGD(model.parameters(), lr=0.01)
         algorithm = gradient_allreduce.GradientAllReduceAlgorithm()
