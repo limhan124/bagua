@@ -120,6 +120,7 @@ class SignumAlgorithmImpl(AlgorithmImpl):
                 """
                 set para.grad or set self.optimizer.state[param]["momentum"] ???
                 """
+
                 def set_momentum_fn(param, t):
                     self.optimizer.state[param]["momentum"] = t
 
@@ -168,7 +169,6 @@ class SignumAlgorithmImpl(AlgorithmImpl):
     #
     #     bucket.append_python_op(compress_momentum_majority_vote, group=self.process_group)
     # def init_operations(self, bagua_ddp: BaguaDistributedDataParallel, bucket: BaguaBucket, ):
-
 
     def init_operations(self, bagua_ddp: BaguaDistributedDataParallel, bucket: BaguaBucket, ):
         bucket.clear_ops()
@@ -249,24 +249,26 @@ class SignumAlgorithm(Algorithm):
 
 
 class SignTensor:
-    def __init__(self, bits):
+    def __init__(self, bits, debug=False):
         self.eps = 1e-7
         self.bits = bits
         self.dtype = torch.int32 if self.bits == 32 else torch.uint8
+        self.src_dtype = None
+        self.debug = debug
 
     def packing(self, src_tensor):
+        self.src_dtype = src_tensor.dtype
         src_tensor = torch.sign(src_tensor)
-        # print(src_tensor.dtype)
         src_tensor_size = src_tensor.size()
         src_tensor = src_tensor.view(-1)
         src_len = len(src_tensor)
         add_elm = self.bits - (src_len % self.bits)
         if src_len % self.bits == 0:
             add_elm = 0
-        zero_tensor = torch.zeros([add_elm], dtype=src_tensor.dtype, device=src_tensor.device)
+        zero_tensor = torch.zeros([add_elm], dtype=self.src_dtype, device=src_tensor.device)
         src_tensor = torch.cat((src_tensor, zero_tensor), 0)
-        src_tensor = src_tensor.view(self.bits, -1)
-        src_tensor = src_tensor.to(dtype=src_tensor.dtype)
+        src_tensor = src_tensor.view(-1, self.bits)
+        src_tensor = src_tensor.to(dtype=self.src_dtype)
         compressed_tensor = self.compress(src_tensor)
         compressed_tensor = compressed_tensor.to(dtype=self.dtype)
         return compressed_tensor, src_tensor_size
@@ -277,14 +279,13 @@ class SignTensor:
         if src_element_num % self.bits == 0:
             add_elm = 0
         compressed_tensor = compressed_tensor.int()
-        dst_tensor = torch.zeros(src_element_num + add_elm, device=compressed_tensor.device, dtype=torch.float32)
-        dst_tensor = dst_tensor.view(self.bits, -1)
+        dst_tensor = torch.zeros(src_element_num + add_elm, device=compressed_tensor.device, dtype=self.src_dtype)
+        dst_tensor = dst_tensor.view(-1, self.bits)
         dst_tensor = self.uncompress(compressed_tensor, dst_tensor)
         dst_tensor = dst_tensor.view(-1)
         dst_tensor = dst_tensor[:src_element_num]
         dst_tensor = dst_tensor.view(src_tensor_size)
         dst_tensor = dst_tensor.float()
-        # print(dst_tensor)
         return dst_tensor
 
     def majority_vote(self, compressed_tensors, src_tensor_size):
@@ -295,6 +296,8 @@ class SignTensor:
         vote_res = torch.sum(vote_res, 0)
         vote_res = torch.sign(vote_res)
         vote_res = vote_res.float()
+        if self.debug:
+            print(vote_res)
         return vote_res
 
     def element_num(self, size):
@@ -304,8 +307,8 @@ class SignTensor:
         return num
 
     def compress(self, src_tensor):
-        src_tensor = src_tensor.permute(1, 0)
-        # print(src_tensor)
+        if self.debug:
+            print(src_tensor)
         # compressed_tensor: -1
         compressed_tensor = torch.zeros(src_tensor.size()[0], dtype=self.dtype, device=src_tensor.device)
         idx = 0
@@ -319,7 +322,8 @@ class SignTensor:
                 bits += str(int(tensor[i].item()))
             compressed_tensor[idx] = torch.tensor(int(bits, 2), dtype=self.dtype)
             idx += 1
-        # print(compressed_tensor)
+        if self.debug:
+            print(compressed_tensor)
         return compressed_tensor
 
     def uncompress(self, compressed_tensor, dst_tensor):
@@ -332,10 +336,11 @@ class SignTensor:
                 binary = '{:032b}'.format(decimal)
             elif self.bits == 8:
                 binary = '{:08b}'.format(decimal)
-            # print(binary)
             for i in range(self.bits):
-                dst_tensor[i][idx] = torch.tensor(-1 if int(binary[i]) == 0 else 1, dtype=dst_tensor.dtype)
+                dst_tensor[idx][i] = torch.tensor(-1 if int(binary[i]) == 0 else 1, dtype=dst_tensor.dtype)
             idx += 1
+        if self.debug:
+            print(dst_tensor)
         return dst_tensor
 
 # class SignTensor:
