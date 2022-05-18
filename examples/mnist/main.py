@@ -256,7 +256,7 @@ def main():
         from signum import SignumOptimizer, SignumAlgorithm
 
         optimizer = SignumOptimizer(
-            model.parameters(), lr=args.lr
+            model.parameters(), lr=1e-4
         )
         algorithm = SignumAlgorithm(optimizer)
     else:
