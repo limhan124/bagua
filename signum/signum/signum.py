@@ -4,7 +4,7 @@ from bagua.torch_api.bucket import BaguaBucket
 from bagua.torch_api.tensor import BaguaTensor
 from bagua.torch_api.data_parallel.bagua_distributed import BaguaDistributedDataParallel
 from bagua.torch_api.algorithms import Algorithm, AlgorithmImpl
-from bagua.torch_api.communication import BaguaProcessGroup, barrier, allgather
+from bagua.torch_api.communication import BaguaProcessGroup, allgather
 from torch.optim.optimizer import Optimizer
 import torch
 import math
@@ -15,7 +15,7 @@ class SignumOptimizer(Optimizer):
     def __init__(
             self,
             params,
-            lr: float = 1e-3,
+            lr: float = 1e-4,
             momentum_beta: float = 0.9,
             weight_decay: float = 0.0,
     ):
@@ -68,6 +68,7 @@ class SignumOptimizer(Optimizer):
 
                 grad = param.grad.data
                 # sign of the gradient
+                # print(grad, state["momentum"])
                 sign_grad = torch.sign(grad)
                 # weight_decay
                 if weight_decay != 0:
@@ -101,6 +102,9 @@ class SignumAlgorithmImpl(AlgorithmImpl):
         self.hierarchical = hierarchical
         self.optimizer = signum_optimizer
         self.compressor = SignTensor(bits=8)
+        self.send_tensor = None
+        self.recv_tensor_list = None
+        self.sign_momentum = None
 
     @property
     def optimizer_step_id(self):
@@ -156,19 +160,18 @@ class SignumAlgorithmImpl(AlgorithmImpl):
     #             # update momentum of the tensor
     #             tensor.bagua_getter_closure().mul_(momentum_beta).add_(tensor.grad, alpha=1 - momentum_beta)
     #             # compress the sign of the momentum
-    #             send_tensor, size = self.compressor.packing(torch.sign(tensor.bagua_getter_closure()))
+    #             send_tensor, size = self.compressor.packing(tensor.bagua_getter_closure())
     #             recv_tensor_list = torch.zeros(
     #                 [self.process_group.get_global_communicator().nranks(), len(send_tensor)],
     #                 device=send_tensor.device, dtype=send_tensor.dtype)
     #             # allgather of the tensor
     #             allgather(send_tensor, recv_tensor_list)
-    #             barrier(self.process_group)
-    #             sign_momentum = self.compressor.majority_vote(recv_tensor_list)
+    #
+    #             sign_momentum = self.compressor.majority_vote(recv_tensor_list, size)
     #             # update the grad
     #             tensor.grad = sign_momentum
     #
     #     bucket.append_python_op(compress_momentum_majority_vote, group=self.process_group)
-    # def init_operations(self, bagua_ddp: BaguaDistributedDataParallel, bucket: BaguaBucket, ):
 
     def init_operations(self, bagua_ddp: BaguaDistributedDataParallel, bucket: BaguaBucket, ):
         bucket.clear_ops()
@@ -181,43 +184,51 @@ class SignumAlgorithmImpl(AlgorithmImpl):
                 # update momentum of the tensor
                 tensor.bagua_getter_closure().mul_(momentum_beta).add_(tensor.grad, alpha=1 - momentum_beta)
                 shapes.append(tensor.bagua_getter_closure().size())
-                send_tensor_list.append(torch.sign(tensor.bagua_getter_closure()).view(-1))
+                send_tensor_list.append(torch.sign(tensor.bagua_getter_closure().data).view(-1))
+
+            # if self.send_tensor is None and self.recv_tensor_list is None:
+            #     self.send_tensor = torch.cat(send_tensor_list)
+            #     self.recv_tensor_list = torch.zeros(
+            #         [self.process_group.get_global_communicator().nranks(), len(self.send_tensor)],
+            #         device=self.send_tensor.device, dtype=self.send_tensor.dtype
+            #     )
+            # else:
+            #     self.send_tensor.copy_(torch.cat(send_tensor_list))
+            # send_tensor, size = self.compressor.packing(self.send_tensor)
+            # # allgather of the whole bucket
+            # allgather(self.send_tensor, self.recv_tensor_list)
+            # self.sign_momentum = torch.sign(torch.sum(self.recv_tensor_list, 0))
+            # cur_idx = 0
+            # for tensor, shape in zip(bucket.tensors, shapes):
+            #     num = self.compressor.element_num(shape)
+            #     tensor.grad = self.sign_momentum[cur_idx:cur_idx + num].view(shape)
+            #     cur_idx += num
 
             # compress the sign of the momentum of the whole bucket
-            send_tensor_list = torch.cat(send_tensor_list)
-            send_tensor, size = self.compressor.packing(send_tensor_list)
-            recv_tensor_list = torch.zeros(
-                [self.process_group.get_global_communicator().nranks(), len(send_tensor)], device=send_tensor.device,
-                dtype=send_tensor.dtype
-            )
+            if self.send_tensor is None and self.recv_tensor_list is None:
+                send_tensor_list = torch.cat(send_tensor_list)
+                self.send_tensor, size = self.compressor.packing(send_tensor_list)
+                self.recv_tensor_list = torch.zeros(
+                    [self.process_group.get_global_communicator().nranks(), len(self.send_tensor)],
+                    device=self.send_tensor.device, dtype=self.send_tensor.dtype
+                )
+            else:
+                send_tensor_list = torch.cat(send_tensor_list)
+                send_tensor, size = self.compressor.packing(send_tensor_list)
+                self.send_tensor.copy_(send_tensor)
             # allgather of the whole bucket
-            allgather(send_tensor, recv_tensor_list)
-            barrier(self.process_group)
+            allgather(self.send_tensor, self.recv_tensor_list)
             # majority_vote
-            sign_momentum = self.compressor.majority_vote(recv_tensor_list, size)
+            self.sign_momentum = self.compressor.majority_vote(self.recv_tensor_list, size)
 
             # change tensor.grad
             cur_idx = 0
             for tensor, shape in zip(bucket.tensors, shapes):
                 num = self.compressor.element_num(shape)
-                tensor.grad = sign_momentum[cur_idx:cur_idx + num].view(shape)
+                tensor.grad = self.sign_momentum[cur_idx:cur_idx + num].view(shape)
                 cur_idx += num
 
         bucket.append_python_op(compress_momentum_majority_vote, group=self.process_group)
-
-        # def calculate_momentum(*args):
-        #     momentum_beta = self.optimizer.param_groups[0]["momentum_beta"]
-        #     for tensor in bucket.tensors:
-        #         tensor.bagua_getter_closure().mul_(momentum_beta).add_(tensor.grad, alpha=1 - momentum_beta)
-        # bucket.append_python_op(calculate_momentum, group=self.process_group)
-        #
-        # bucket.append_centralized_synchronous_op(
-        #     hierarchical=self.hierarchical,
-        #     average=True,
-        #     scattergather=True,
-        #     compression="MinMaxUInt8",
-        #     group=self.process_group,
-        # )
 
     def init_backward_hook(self, bagua_ddp: BaguaDistributedDataParallel):
         def hook_momentum(parameter_name, parameter):
@@ -258,9 +269,8 @@ class SignTensor:
 
     def packing(self, src_tensor):
         self.src_dtype = src_tensor.dtype
-        src_tensor = torch.sign(src_tensor)
         src_tensor_size = src_tensor.size()
-        src_tensor = src_tensor.view(-1)
+        src_tensor = torch.sign(src_tensor.view(-1))
         src_len = len(src_tensor)
         add_elm = self.bits - (src_len % self.bits)
         if src_len % self.bits == 0:
@@ -269,6 +279,8 @@ class SignTensor:
         src_tensor = torch.cat((src_tensor, zero_tensor), 0)
         src_tensor = src_tensor.view(-1, self.bits)
         src_tensor = src_tensor.to(dtype=self.src_dtype)
+        """
+        """
         compressed_tensor = self.compress(src_tensor)
         compressed_tensor = compressed_tensor.to(dtype=self.dtype)
         return compressed_tensor, src_tensor_size
@@ -281,6 +293,8 @@ class SignTensor:
         compressed_tensor = compressed_tensor.int()
         dst_tensor = torch.zeros(src_element_num + add_elm, device=compressed_tensor.device, dtype=self.src_dtype)
         dst_tensor = dst_tensor.view(-1, self.bits)
+        """
+        """
         dst_tensor = self.uncompress(compressed_tensor, dst_tensor)
         dst_tensor = dst_tensor.view(-1)
         dst_tensor = dst_tensor[:src_element_num]
@@ -309,36 +323,23 @@ class SignTensor:
     def compress(self, src_tensor):
         if self.debug:
             print(src_tensor)
-        # compressed_tensor: -1
-        compressed_tensor = torch.zeros(src_tensor.size()[0], dtype=self.dtype, device=src_tensor.device)
-        idx = 0
-        # src_tensor: -1*self.bits
-        for tensor in src_tensor:
-            mask = tensor == -1
-            tensor[mask] = 0
-            tensor[~mask] = 1
-            bits = ""
-            for i in range(self.bits):
-                bits += str(int(tensor[i].item()))
-            compressed_tensor[idx] = torch.tensor(int(bits, 2), dtype=self.dtype)
-            idx += 1
+        src_tensor = src_tensor.permute(1, 0)
+        # src_tensor: self.bits * -1
+        for i in range(self.bits-1):
+            src_tensor[0].mul_(2).add_(src_tensor[i+1])
         if self.debug:
-            print(compressed_tensor)
-        return compressed_tensor
+            print(src_tensor[0])
+        return src_tensor[0]
 
     def uncompress(self, compressed_tensor, dst_tensor):
-        idx = 0
-        for item in compressed_tensor:
-            decimal = item.item()
-            if self.bits == 32:
-                if item.item() < 0:
-                    decimal += 2147483648 + 2147483648
-                binary = '{:032b}'.format(decimal)
-            elif self.bits == 8:
-                binary = '{:08b}'.format(decimal)
-            for i in range(self.bits):
-                dst_tensor[idx][i] = torch.tensor(-1 if int(binary[i]) == 0 else 1, dtype=dst_tensor.dtype)
-            idx += 1
+        dst_tensor = dst_tensor.permute(1, 0)
+        for i in range(self.bits):
+            dst_tensor[self.bits - 1 - i] = compressed_tensor - 2 * compressed_tensor.floor_divide(2)
+            compressed_tensor.floor_divide_(2)
+        mask = dst_tensor == 0
+        dst_tensor[mask] = -1
+        dst_tensor[~mask] = 1
+        dst_tensor = dst_tensor.permute(1, 0)
         if self.debug:
             print(dst_tensor)
         return dst_tensor
