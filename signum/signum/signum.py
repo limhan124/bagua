@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-from torch.optim.lr_scheduler import StepLR
 from bagua.torch_api.bucket import BaguaBucket
 from bagua.torch_api.tensor import BaguaTensor
 from bagua.torch_api.data_parallel.bagua_distributed import BaguaDistributedDataParallel
