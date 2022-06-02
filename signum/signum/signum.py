@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-
+from torch.optim.lr_scheduler import StepLR
 from bagua.torch_api.bucket import BaguaBucket
 from bagua.torch_api.tensor import BaguaTensor
 from bagua.torch_api.data_parallel.bagua_distributed import BaguaDistributedDataParallel
@@ -18,6 +18,9 @@ class SignumOptimizer(Optimizer):
             lr: float = 1e-4,
             momentum_beta: float = 0.9,
             weight_decay: float = 0.0,
+            adjust_lr=True,
+            decay_float=0.9,
+            decay_int=2000,
     ):
         """
         Args:
@@ -33,7 +36,8 @@ class SignumOptimizer(Optimizer):
             raise ValueError("Invalid momentum_beta value: {}".format(momentum_beta))
         if not 0.0 <= weight_decay:
             raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
-        defaults = dict(lr=lr, momentum_beta=momentum_beta, weight_decay=weight_decay)
+        defaults = dict(lr=lr, momentum_beta=momentum_beta, weight_decay=weight_decay, adjust_lr=adjust_lr,
+                        decay_float=decay_float, decay_int=decay_int)
         super(SignumOptimizer, self).__init__(params, defaults)
         for group_id, group in enumerate(self.param_groups):
             for param_id, param in enumerate(group["params"]):
@@ -56,7 +60,10 @@ class SignumOptimizer(Optimizer):
             # here the momentum_beta is not used, because the update of momentum is performed before compression
             # momentum_beta=0 yields signSGD not signum
             momentum_beta = group['momentum_beta']
-            weight_decay = group["weight_decay"]
+            weight_decay = group['weight_decay']
+            decay_float = group['decay_float']
+            decay_int = group['decay_int']
+            adjust_lr = group['adjust_lr']
 
             for param_id, param in enumerate(group["params"]):
                 if param.grad is None:
@@ -68,19 +75,16 @@ class SignumOptimizer(Optimizer):
 
                 grad = param.grad.data
                 # sign of the gradient
-                # print(grad, state["momentum"])
                 sign_grad = torch.sign(grad)
                 # weight_decay
                 if weight_decay != 0:
                     sign_grad.add_(param.data, alpha=weight_decay)
 
-                # # adjust lr using "step" or using LARC
-                # state["step"] += 1
-                # step_id = state["step"]
-                # bias_correction1 = 1 - momentum_beta ** step_id
-                # lr = lr / bias_correction1
+                # adjust lr using "step" or using LARC
+                if adjust_lr and step_id % decay_int == 0:
+                    lr = lr * (decay_float ** (step_id // decay_int))
+                    group["lr"] = lr
 
-                # print(sign_grad)
                 param.data.add_(sign_grad, alpha=-lr)
         return loss
 
@@ -334,8 +338,8 @@ class SignTensor:
     def uncompress(self, compressed_tensor, dst_tensor):
         dst_tensor = dst_tensor.permute(1, 0)
         for i in range(self.bits):
-            dst_tensor[self.bits - 1 - i] = compressed_tensor - 2 * compressed_tensor.floor_divide(2)
-            compressed_tensor.floor_divide_(2)
+            dst_tensor[self.bits - 1 - i] = compressed_tensor - 2 * compressed_tensor.div(2, rounding_mode='floor')
+            compressed_tensor.div_(2, rounding_mode='floor')
         mask = dst_tensor == 0
         dst_tensor[mask] = -1
         dst_tensor[~mask] = 1
