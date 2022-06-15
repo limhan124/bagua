@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import math
 
+import math
 from bagua.torch_api.bucket import BaguaBucket
 from bagua.torch_api.tensor import BaguaTensor
 from bagua.torch_api.data_parallel.bagua_distributed import BaguaDistributedDataParallel
@@ -28,32 +28,50 @@ class SignTensor:
             add_elm = 0
         zero_tensor = torch.zeros([add_elm], dtype=self.src_dtype, device=src_tensor.device)
         src_tensor = torch.cat((src_tensor, zero_tensor), 0)
-        src_tensor = src_tensor.view(-1, self.bits)
+        # src_tensor: self.bits * -1
+        mask = src_tensor == -1
+        src_tensor[mask] = 0
+        # src_tensor[~mask] = 1
+        src_tensor = src_tensor.view(self.bits, -1)
         src_tensor = src_tensor.to(dtype=self.src_dtype)
-        """
-        """
         compressed_tensor = self.compress(src_tensor)
         compressed_tensor = compressed_tensor.to(dtype=self.dtype)
         return compressed_tensor, src_tensor_size
 
+    def compress(self, src_tensor):
+        if self.debug:
+            print(src_tensor)
+        # src_tensor: self.bits * -1
+        for i in range(self.bits - 1):
+            src_tensor[0].mul_(2).add_(src_tensor[i + 1])
+        if self.debug:
+            print(src_tensor[0])
+        return src_tensor[0]
+
     def unpacking(self, compressed_tensor, src_tensor_size):
         src_element_num = self.element_num(src_tensor_size)
         param_num = self.element_num(compressed_tensor.size()) * 8
-        # add_elm = self.bits - (src_element_num % self.bits)
-        # if src_element_num % self.bits == 0:
-        #     add_elm = 0
-        # compressed_tensor = compressed_tensor.int()
-        # dst_tensor = torch.zeros(src_element_num + add_elm, device=compressed_tensor.device, dtype=self.src_dtype)
         compressed_tensor = compressed_tensor.int()
         dst_tensor = torch.zeros(param_num, device=compressed_tensor.device, dtype=self.src_dtype)
-        dst_tensor = dst_tensor.view(-1, self.bits)
-        """
-        """
+        # src_tensor: self.bits * -1
+        dst_tensor = dst_tensor.view(self.bits, -1)
         dst_tensor = self.uncompress(compressed_tensor, dst_tensor)
         dst_tensor = dst_tensor.view(-1)
         dst_tensor = dst_tensor[:src_element_num]
         dst_tensor = dst_tensor.view(src_tensor_size)
         dst_tensor = dst_tensor.float()
+        return dst_tensor
+
+    def uncompress(self, compressed_tensor, dst_tensor):
+        for i in range(self.bits - 1):
+            dst_tensor[self.bits - 1 - i] = compressed_tensor - 2 * compressed_tensor.div(2, rounding_mode='floor')
+            compressed_tensor.div_(2, rounding_mode='floor')
+        dst_tensor[0] = compressed_tensor
+        mask = dst_tensor == 0
+        dst_tensor[mask] = -1
+        dst_tensor[~mask] = 1
+        if self.debug:
+            print(dst_tensor)
         return dst_tensor
 
     def majority_vote(self, compressed_tensors, src_tensor_size):
@@ -73,30 +91,6 @@ class SignTensor:
         for i in range(len(size)):
             num *= size[i]
         return num
-
-    def compress(self, src_tensor):
-        if self.debug:
-            print(src_tensor)
-        src_tensor = src_tensor.permute(1, 0)
-        # src_tensor: self.bits * -1
-        for i in range(self.bits-1):
-            src_tensor[0].mul_(2).add_(src_tensor[i+1])
-        if self.debug:
-            print(src_tensor[0])
-        return src_tensor[0]
-
-    def uncompress(self, compressed_tensor, dst_tensor):
-        dst_tensor = dst_tensor.permute(1, 0)
-        for i in range(self.bits):
-            dst_tensor[self.bits - 1 - i] = compressed_tensor - 2 * compressed_tensor.div(2, rounding_mode='floor')
-            compressed_tensor.div_(2, rounding_mode='floor')
-        mask = dst_tensor == 0
-        dst_tensor[mask] = -1
-        dst_tensor[~mask] = 1
-        dst_tensor = dst_tensor.permute(1, 0)
-        if self.debug:
-            print(dst_tensor)
-        return dst_tensor
 
 
 class SignSGDAlgorithmImpl(AlgorithmImpl):
@@ -118,7 +112,7 @@ class SignSGDAlgorithmImpl(AlgorithmImpl):
         for layer in self.optimizer.param_groups[0]['params']:
             self.parameters_num += layer.numel()
 
-        self.send_tensor = torch.zeros(int(math.ceil(self.parameters_num/8)), device=self.device, dtype=torch.uint8)
+        self.send_tensor = torch.zeros(int(math.ceil(self.parameters_num / 8)), device=self.device, dtype=torch.uint8)
         self.recv_tensor_list = torch.zeros(
             [self.process_group.get_global_communicator().nranks(), len(self.send_tensor)],
             device=self.send_tensor.device, dtype=self.send_tensor.dtype
@@ -139,24 +133,6 @@ class SignSGDAlgorithmImpl(AlgorithmImpl):
             bagua_buckets.append(bagua_bucket)
         return bagua_buckets
 
-    def init_operations(
-            self,
-            bagua_ddp: BaguaDistributedDataParallel,
-            bucket: BaguaBucket,
-    ):
-        bucket.clear_ops()
-
-        # def sign_grad(*args):
-        #     for tensor in bucket.tensors:
-        #         sign_grad = torch.sign(tensor.grad)
-        #         tensor.grad.copy_(sign_grad)
-        #
-        # bucket.append_python_op(sign_grad, group=self.process_group)
-        bucket.append_centralized_synchronous_op(
-            hierarchical=self.hierarchical,
-            average=self.average,
-            group=self.process_group,
-        )
 
     def init_post_backward_hook(self, bagua_ddp: BaguaDistributedDataParallel):
         """Given a :class:`~bagua.torch_api.data_parallel.BaguaDistributedDataParallel`, return a hook function that will be executed when the
@@ -168,6 +144,7 @@ class SignSGDAlgorithmImpl(AlgorithmImpl):
         Returns:
             A function that takes no argument.
         """
+
         def compress_momentum_majority_vote():
             shapes = []
             send_tensor_list = []
@@ -214,6 +191,7 @@ class SignSGDAlgorithm(Algorithm):
             hierarchical=self.hierarchical,
             average=self.average,
         )
+
 
 class SignSGDOptimizer(Optimizer):
     def __init__(
@@ -265,6 +243,10 @@ class SignSGDOptimizer(Optimizer):
             for param_id, param in enumerate(group["params"]):
                 if param.grad is None:
                     continue
+
+                state = self.state[param]
+                state["step"] += 1
+                step_id = state["step"]
 
                 grad = param.grad.data
                 # sign of the gradient
