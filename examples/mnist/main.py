@@ -166,6 +166,13 @@ def main():
         default=False,
         help="fuse optimizer or not",
     )
+    parser.add_argument(
+        "--momentum",
+        type=float,
+        default=0.9,
+        metavar="MOMENTUM",
+        help="momentum (default: 0.9)",
+    )
 
     args = parser.parse_args()
     if args.set_deterministic:
@@ -256,9 +263,16 @@ def main():
         from signum import SignumOptimizer, SignumAlgorithm
 
         optimizer = SignumOptimizer(
-            model.parameters(), lr=1e-4
+            model.parameters(), lr=args.lr, momentum_beta=args.momentum
         )
         algorithm = SignumAlgorithm(optimizer)
+    elif args.algorithm == "signSGD":
+        from signSGD import SignSGDOptimizer, SignSGDAlgorithm
+
+        optimizer = SignSGDOptimizer(
+            model.parameters(), lr=args.lr
+        )
+        algorithm = SignSGDAlgorithm(optimizer)
     else:
         raise NotImplementedError
 
