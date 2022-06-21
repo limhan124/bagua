@@ -1,5 +1,8 @@
 from __future__ import print_function
 import argparse
+import time
+from pathlib import Path
+
 import numpy as np
 import random
 import torch
@@ -53,12 +56,13 @@ def train(args, model, train_loader, optimizer, epoch):
             optimizer.step()
         if batch_idx % args.log_interval == 0:
             logging.info(
-                "Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
+                "Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}, Time: {}".format(
                     epoch,
                     batch_idx * len(data),
                     len(train_loader.dataset),
                     100.0 * batch_idx / len(train_loader),
                     loss.item(),
+                    time.time()
                 )
             )
 
@@ -82,11 +86,12 @@ def test(model, test_loader):
     test_loss /= len(test_loader.dataset)
 
     logging.info(
-        "\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n".format(
+        "\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%), Time: {}\n".format(
             test_loss,
             correct,
             len(test_loader.dataset),
             100.0 * correct / len(test_loader.dataset),
+            time.time()
         )
     )
 
@@ -173,6 +178,18 @@ def main():
         metavar="MOMENTUM",
         help="momentum (default: 0.9)",
     )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=1e-5,
+        metavar="WEIGHT_DECAY",
+        help="weight_decay (default: 1e-5)",
+    )
+    parser.add_argument(
+        "--save-dir",
+        type=str,
+        default=Path.cwd(),
+        help='Directory to save logs and models.')
 
     args = parser.parse_args()
     if args.set_deterministic:
@@ -270,7 +287,7 @@ def main():
         from signSGD import SignSGDOptimizer, SignSGDAlgorithm
 
         optimizer = SignSGDOptimizer(
-            model.parameters(), lr=args.lr
+            model.parameters(), lr=args.lr, momentum_beta=args.momentum, weight_decay=args.weight_decay
         )
         algorithm = SignSGDAlgorithm(optimizer)
     else:

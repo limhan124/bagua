@@ -63,10 +63,9 @@ class SignTensor:
         return dst_tensor
 
     def uncompress(self, compressed_tensor, dst_tensor):
-        for i in range(self.bits - 1):
+        for i in range(self.bits):
             dst_tensor[self.bits - 1 - i] = compressed_tensor - 2 * compressed_tensor.div(2, rounding_mode='floor')
             compressed_tensor.div_(2, rounding_mode='floor')
-        dst_tensor[0] = compressed_tensor
         mask = dst_tensor == 0
         dst_tensor[mask] = -1
         dst_tensor[~mask] = 1
