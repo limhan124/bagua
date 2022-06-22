@@ -304,6 +304,10 @@ def main():
         optimizer = bagua.contrib.fuse_optimizer(optimizer)
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
+
+    start_time = time.time()
+    logging.info("\n********************\tStart Time: {}\t********************\n".format(start_time))
+
     for epoch in range(1, args.epochs + 1):
         if args.algorithm == "async":
             model.bagua_algorithm.resume(model)
@@ -315,6 +319,10 @@ def main():
 
         test(model, test_loader)
         scheduler.step()
+
+    end_time = time.time()
+    logging.info("\n********************\tEnd Time: {}\t********************\n".format(end_time))
+    logging.info("\n********************\tTOTAL TIME(s): {}\t********************\n".format(end_time-start_time))
 
     if args.save_model:
         torch.save(model.state_dict(), "mnist_cnn.pt")
