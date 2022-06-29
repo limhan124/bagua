@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import math
+import bagua.torch_api as bagua
 from bagua.torch_api.bucket import BaguaBucket
 from bagua.torch_api.tensor import BaguaTensor
 from bagua.torch_api.data_parallel.bagua_distributed import BaguaDistributedDataParallel
@@ -10,6 +11,12 @@ from torch.optim.optimizer import Optimizer
 import torch
 from typing import List
 import bit2byte
+
+"""
+1. time for allgather and compressor
+2. modify gradient_allreduce to allreduce() implemented in Python
+"""
+
 
 class SignTensor:
     def __init__(self, bits, debug=False):
@@ -37,7 +44,7 @@ class SignTensor:
 
     def unpacking(self, compressed_tensor, src_tensor_size):
         src_element_num = self.element_num(src_tensor_size)
-        param_num = self.element_num(compressed_tensor.size()) * 8
+        param_num = self.element_num(compressed_tensor.size()) * self.bits
         compressed_tensor = compressed_tensor.int()
         dst_tensor = torch.ones(param_num, device=compressed_tensor.device, dtype=self.dtype)
         # src_tensor: self.bits * -1
@@ -51,15 +58,22 @@ class SignTensor:
         return dst_tensor
 
     def majority_vote(self, compressed_tensors, src_tensor_size):
-        vote_res = []
-        for compressed_tensor in compressed_tensors:
-            vote_res.append(self.unpacking(compressed_tensor, src_tensor_size))
+        vote_num = compressed_tensors.size()[0]
+        vote_size = self.element_num(compressed_tensors[0].size())
+        src_element_num = self.element_num(src_tensor_size)
+        compressed_tensor = compressed_tensors.view(-1)
+        param_num = self.element_num(compressed_tensor.size()) * self.bits
+        dst_tensor = torch.ones(param_num, device=compressed_tensor.device, dtype=self.dtype)
+        # src_tensor: self.bits * -1
+        dst_tensor = dst_tensor.view(self.bits, -1)
+        dst_tensor = bit2byte.uncompress(compressed_tensor, dst_tensor)
+        dst_tensor = dst_tensor.float()
+        dst_tensor -= 1
+        vote_res = [dst_tensor[:, i * vote_size:(i + 1) * vote_size].contiguous().view(-1) for i in range(vote_num)]
         vote_res = torch.stack(vote_res)
         vote_res = torch.sum(vote_res, 0)
-        vote_res = torch.sign(vote_res)
+        vote_res = torch.sign(vote_res)[:src_element_num]
         vote_res = vote_res.float()
-        # if self.debug:
-        #     print(vote_res)
         return vote_res
 
     def element_num(self, size):
@@ -67,102 +81,6 @@ class SignTensor:
         for i in range(len(size)):
             num *= size[i]
         return num
-
-
-class SignSGDAlgorithmImpl(AlgorithmImpl):
-    def __init__(
-            self,
-            process_group: BaguaProcessGroup,
-            optimizer: Optimizer,
-            hierarchical: bool = True,
-            average: bool = True,
-            device='cuda'
-    ):
-        super(SignSGDAlgorithmImpl, self).__init__(process_group)
-        self.hierarchical = hierarchical
-        self.average = average
-        self.optimizer = optimizer
-        self.compressor = SignTensor(bits=8)
-        self.device = device
-        self.parameters_num = 0
-        for layer in self.optimizer.param_groups[0]['params']:
-            self.parameters_num += layer.numel()
-
-        self.send_tensor = torch.zeros(int(math.ceil(self.parameters_num / 8)), device=self.device, dtype=torch.uint8)
-        self.recv_tensor_list = torch.zeros(
-            [self.process_group.get_global_communicator().nranks(), len(self.send_tensor)],
-            device=self.send_tensor.device, dtype=self.send_tensor.dtype
-        )
-        self.sign_momentum = torch.zeros(self.parameters_num, device=self.send_tensor.device, dtype=torch.float32)
-
-    def tensors_to_buckets(
-            self, tensors: List[List[BaguaTensor]], do_flatten: bool
-    ) -> List[BaguaBucket]:
-        bagua_buckets = []
-        for idx, bucket in enumerate(tensors):
-            bagua_bucket = BaguaBucket(
-                bucket,
-                flatten=do_flatten,
-                name=str(idx),
-                alignment=self.process_group.get_global_communicator().nranks(),
-            )
-            bagua_buckets.append(bagua_bucket)
-        return bagua_buckets
-
-    def init_post_backward_hook(self, bagua_ddp: BaguaDistributedDataParallel):
-        """Given a :class:`~bagua.torch_api.data_parallel.BaguaDistributedDataParallel`, return a hook function that will be executed when the
-        backward pass is done.
-
-        Args:
-            bagua_ddp: :class:`bagua.torch_api.data_parallel.BaguaDistributedDataParallel`.
-
-        Returns:
-            A function that takes no argument.
-        """
-
-        def compress_momentum_majority_vote():
-            send_tensor_list = []
-            momentum_beta = self.optimizer.param_groups[0]["momentum_beta"]
-            for group in self.optimizer.param_groups:
-                for param in group["params"]:
-                    self.optimizer.state[param]["momentum"].mul_(momentum_beta).add_(param.grad, alpha=1 - momentum_beta)
-                    send_tensor_list.append(torch.sign(self.optimizer.state[param]["momentum"].data).view(-1))
-
-            send_tensor_list = torch.cat(send_tensor_list)
-            # print("original_tensor_size", send_tensor_list.element_size() * send_tensor_list.nelement())
-            send_tensor, _size = self.compressor.packing(send_tensor_list)
-            self.send_tensor.copy_(send_tensor)
-            # print("send_tensor_size", self.send_tensor.element_size() * self.send_tensor.nelement())
-
-            # allgather of the whole bucket
-            allgather(self.send_tensor, self.recv_tensor_list)
-            # majority_vote
-            self.sign_momentum = self.compressor.majority_vote(self.recv_tensor_list, _size)
-
-            # change tensor.grad
-            cur_idx = 0
-            for group in self.optimizer.param_groups:
-                for param in group["params"]:
-                    num = self.compressor.element_num(param.size())
-                    param.grad.copy_(self.sign_momentum[cur_idx:cur_idx + num].view(param.size()))
-                    cur_idx += num
-
-        return compress_momentum_majority_vote
-
-
-class SignSGDAlgorithm(Algorithm):
-    def __init__(self, optimizer: Optimizer, hierarchical: bool = True, average: bool = True):
-        self.optimizer = optimizer
-        self.hierarchical = hierarchical
-        self.average = average
-
-    def reify(self, process_group: BaguaProcessGroup) -> SignSGDAlgorithmImpl:
-        return SignSGDAlgorithmImpl(
-            process_group,
-            optimizer=self.optimizer,
-            hierarchical=self.hierarchical,
-            average=self.average,
-        )
 
 
 class SignSGDOptimizer(Optimizer):
@@ -189,6 +107,11 @@ class SignSGDOptimizer(Optimizer):
             raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
         defaults = dict(lr=lr, momentum_beta=momentum_beta, weight_decay=weight_decay)
         super(SignSGDOptimizer, self).__init__(params, defaults)
+        self.compress_time = 0.0
+        self.allgather_time = 0.0
+        self.uncompress_time = 0.0
+        self.change_grad_time = 0.0
+        self.allgather_without_compressor_time = 0.0
         for group_id, group in enumerate(self.param_groups):
             for param_id, param in enumerate(group["params"]):
                 state = self.state[param]
@@ -229,3 +152,193 @@ class SignSGDOptimizer(Optimizer):
 
                 param.data.add_(sign_grad, alpha=-lr)
         return loss
+
+
+class SignSGDAlgorithmImpl(AlgorithmImpl):
+    def __init__(
+            self,
+            process_group: BaguaProcessGroup,
+            optimizer: SignSGDOptimizer,
+            compress=True,
+            print_memory_size=False,
+            record_time=True,
+            hierarchical: bool = True,
+            average: bool = True,
+            device='cuda'
+    ):
+        super(SignSGDAlgorithmImpl, self).__init__(process_group)
+        self.optimizer = optimizer
+        self.compress = compress
+        self.print_memory_size = print_memory_size
+        self.record_time = record_time
+        self.send_tensor_type = torch.uint8 if self.compress else torch.float32
+        self.hierarchical = hierarchical
+        self.average = average
+        self.compressor = SignTensor(bits=8)
+        self.device = device
+        self.print_time = bagua.get_rank()==0
+        self.parameters_num = 0
+        for layer in self.optimizer.param_groups[0]['params']:
+            self.parameters_num += layer.numel()
+
+        if self.compress:
+            self.send_tensor = torch.zeros(int(math.ceil(self.parameters_num / 8)), device=self.device,
+                                           dtype=self.send_tensor_type)
+            self.recv_tensor_list = torch.zeros(
+                [self.process_group.get_global_communicator().nranks(), len(self.send_tensor)],
+                device=self.send_tensor.device, dtype=self.send_tensor.dtype
+            )
+            self.sign_momentum = torch.zeros(self.parameters_num, device=self.send_tensor.device, dtype=torch.float32)
+        else:
+            self.send_tensor = torch.zeros(self.parameters_num, device=self.device, dtype=self.send_tensor_type)
+            self.recv_tensor_list = torch.zeros(
+                [self.process_group.get_global_communicator().nranks(), len(self.send_tensor)],
+                device=self.send_tensor.device, dtype=self.send_tensor.dtype
+            )
+            self.sign_momentum = torch.zeros(self.parameters_num, device=self.send_tensor.device, dtype=torch.float32)
+
+    def tensors_to_buckets(
+            self, tensors: List[List[BaguaTensor]], do_flatten: bool
+    ) -> List[BaguaBucket]:
+        bagua_buckets = []
+        for idx, bucket in enumerate(tensors):
+            bagua_bucket = BaguaBucket(
+                bucket,
+                flatten=do_flatten,
+                name=str(idx),
+                alignment=self.process_group.get_global_communicator().nranks(),
+            )
+            bagua_buckets.append(bagua_bucket)
+        return bagua_buckets
+
+    def init_post_backward_hook(self, bagua_ddp: BaguaDistributedDataParallel):
+        """Given a :class:`~bagua.torch_api.data_parallel.BaguaDistributedDataParallel`, return a hook function that will be executed when the
+        backward pass is done.
+
+        Args:
+            bagua_ddp: :class:`bagua.torch_api.data_parallel.BaguaDistributedDataParallel`.
+
+        Returns:
+            A function that takes no argument.
+        """
+
+        def compress_momentum_majority_vote():
+            send_tensor_list = []
+            momentum_beta = self.optimizer.param_groups[0]["momentum_beta"]
+            for group in self.optimizer.param_groups:
+                for param in group["params"]:
+                    self.optimizer.state[param]["momentum"].mul_(momentum_beta).add_(param.grad, alpha=1 - momentum_beta)
+                    send_tensor_list.append(torch.sign(self.optimizer.state[param]["momentum"].data).view(-1))
+
+            send_tensor_list = torch.cat(send_tensor_list)
+
+            import time
+            if self.compress:
+                if self.print_memory_size:
+                    print("original_tensor_size", send_tensor_list.element_size() * send_tensor_list.nelement())
+
+                if self.record_time:
+                    # compress send_tensor
+                    start_time = time.time()
+                    send_tensor, _size = self.compressor.packing(send_tensor_list)
+                    end_time = time.time()
+                    self.optimizer.compress_time += end_time - start_time
+                    self.send_tensor.copy_(send_tensor)
+
+                    # allgather of all the params
+                    start_time = time.time()
+                    allgather(self.send_tensor, self.recv_tensor_list)
+                    end_time = time.time()
+                    self.optimizer.allgather_time += end_time - start_time
+
+                    # majority_vote/uncompress
+                    start_time = time.time()
+                    self.sign_momentum = self.compressor.majority_vote(self.recv_tensor_list, _size)
+                    end_time = time.time()
+                    self.optimizer.uncompress_time += end_time - start_time
+                else:
+                    # compress send_tensor
+                    send_tensor, _size = self.compressor.packing(send_tensor_list)
+                    self.send_tensor.copy_(send_tensor)
+                    # allgather of all the params
+                    allgather(self.send_tensor, self.recv_tensor_list)
+                    # majority_vote/uncompress
+                    self.sign_momentum = self.compressor.majority_vote(self.recv_tensor_list, _size)
+
+                if self.print_memory_size:
+                    print("send_tensor_size", self.send_tensor.element_size() * self.send_tensor.nelement())
+
+            else:
+                self.send_tensor.copy_(send_tensor_list)
+                if self.record_time:
+                    start_time = time.time()
+                    allgather(self.send_tensor, self.recv_tensor_list)
+                    self.sign_momentum = torch.sign(torch.sum(self.recv_tensor_list, 0)).float()
+                    end_time = time.time()
+                    self.optimizer.allgather_without_compressor_time += end_time - start_time
+                else:
+                    allgather(self.send_tensor, self.recv_tensor_list)
+                    self.sign_momentum = torch.sign(torch.sum(self.recv_tensor_list, 0)).float()
+
+            # # compress send_tensor
+            # start_time = time.time()
+            # send_tensor, _size = self.compressor.packing(send_tensor_list)
+            # end_time = time.time()
+            # self.optimizer.compress_time += end_time - start_time
+            # self.send_tensor.copy_(send_tensor)
+            #
+            # # allgather of all the params
+            # start_time = time.time()
+            # allgather(self.send_tensor, self.recv_tensor_list)
+            # end_time = time.time()
+            # self.optimizer.allgather_time += end_time - start_time
+            #
+            # # majority_vote
+            # start_time = time.time()
+            # self.sign_momentum = self.compressor.majority_vote(self.recv_tensor_list, _size)
+            # end_time = time.time()
+            # self.optimizer.uncompress_time += end_time - start_time
+
+            # change tensor.grad
+            if self.record_time:
+                start_time = time.time()
+                cur_idx = 0
+                for group in self.optimizer.param_groups:
+                    for param in group["params"]:
+                        num = self.compressor.element_num(param.size())
+                        param.grad.copy_(self.sign_momentum[cur_idx:cur_idx + num].view(param.size()))
+                        cur_idx += num
+                end_time = time.time()
+                self.optimizer.change_grad_time += end_time - start_time
+            else:
+                cur_idx = 0
+                for group in self.optimizer.param_groups:
+                    for param in group["params"]:
+                        num = self.compressor.element_num(param.size())
+                        param.grad.copy_(self.sign_momentum[cur_idx:cur_idx + num].view(param.size()))
+                        cur_idx += num
+            # if self.print_time:
+            #     print("allgather_without_compressor_time", self.optimizer.allgather_without_compressor_time)
+        return compress_momentum_majority_vote
+
+
+class SignSGDAlgorithm(Algorithm):
+    def __init__(self, optimizer: SignSGDOptimizer, compress=True, print_memory_size=False, record_time=True,
+                 hierarchical: bool = True, average: bool = True):
+        self.optimizer = optimizer
+        self.compress = compress
+        self.print_memory_size = print_memory_size
+        self.record_time = record_time
+        self.hierarchical = hierarchical
+        self.average = average
+
+    def reify(self, process_group: BaguaProcessGroup) -> SignSGDAlgorithmImpl:
+        return SignSGDAlgorithmImpl(
+            process_group,
+            optimizer=self.optimizer,
+            compress=self.compress,
+            print_memory_size=self.print_memory_size,
+            record_time=self.record_time,
+            hierarchical=self.hierarchical,
+            average=self.average,
+        )

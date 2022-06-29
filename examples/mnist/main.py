@@ -190,6 +190,24 @@ def main():
         type=str,
         default=Path.cwd(),
         help='Directory to save logs and models.')
+    parser.add_argument(
+        "--compress",
+        action="store_true",
+        default=False,
+        help="For Compressing the send_tensor for signSGD algorithm",
+    )
+    parser.add_argument(
+        "--print_memory_size",
+        action="store_true",
+        default=False,
+        help="For Printing the memory size of send_tensor before and after compression",
+    )
+    parser.add_argument(
+        "--record_time",
+        action="store_true",
+        default=False,
+        help="For Recording the time for signSGD algorithm",
+    )
 
     args = parser.parse_args()
     if args.set_deterministic:
@@ -290,7 +308,15 @@ def main():
         optimizer = SignSGDOptimizer(
             model.parameters(), lr=args.lr, momentum_beta=args.momentum, weight_decay=args.weight_decay
         )
-        algorithm = SignSGDAlgorithm(optimizer)
+        algorithm = SignSGDAlgorithm(optimizer, compress=args.compress, print_memory_size=args.print_memory_size,
+                                     record_time=args.record_time)
+    elif args.algorithm == "g_a_r_t":
+        from gradient_allreduce_record_time import SGD_Record_Time_Optimizer, Gradient_Allreduce_Record_Time_Algorithm
+
+        optimizer = SGD_Record_Time_Optimizer(
+            model.parameters(), lr=args.lr, momentum_beta=args.momentum, weight_decay=args.weight_decay
+        )
+        algorithm = Gradient_Allreduce_Record_Time_Algorithm(optimizer, record_time=args.record_time)
     else:
         raise NotImplementedError
 
@@ -317,12 +343,32 @@ def main():
         if args.algorithm == "async":
             model.bagua_algorithm.abort(model)
 
+        if args.algorithm == "signSGD":
+            if args.compress:
+                logging.info("Train Epoch: {} \tCompress Time(s): {}".format(epoch, optimizer.compress_time))
+                logging.info("Train Epoch: {} \tAllgather Time(s): {}".format(epoch, optimizer.allgather_time))
+                logging.info("Train Epoch: {} \tUncompress Time(s): {}".format(epoch, optimizer.uncompress_time))
+                logging.info("Train Epoch: {} \tChange_grad Time(s): {}".format(epoch, optimizer.change_grad_time))
+                logging.info("Train Epoch: {} \tAllgather Without Compression Time(s): {}".
+                             format(epoch, optimizer.allgather_without_compressor_time))
+            else:
+                logging.info("Train Epoch: {} \tCompress Time(s): {}".format(epoch, optimizer.compress_time))
+                logging.info("Train Epoch: {} \tAllgather Time(s): {}".format(epoch, optimizer.allgather_time))
+                logging.info("Train Epoch: {} \tUncompress Time(s): {}".format(epoch, optimizer.uncompress_time))
+                logging.info("Train Epoch: {} \tChange_grad Time(s): {}".format(epoch, optimizer.change_grad_time))
+                logging.info("Train Epoch: {} \tAllgather Without Compression Time(s): {}".
+                             format(epoch, optimizer.allgather_without_compressor_time))
+        if args.algorithm == 'g_a_r_t':
+            logging.info("Train Epoch: {} \tChange_grad Time(s): {}".format(epoch, optimizer.change_grad_time))
+            logging.info("Train Epoch: {} \tAllreduce Without Compression Time(s): {}".
+                         format(epoch, optimizer.allreduce_without_compressor_time))
+
         test(model, test_loader)
         scheduler.step()
 
     end_time = time.time()
-    logging.info("\n********************\tEnd Time: {}\t********************\n".format(end_time))
-    logging.info("\n********************\tTOTAL TIME(s): {}\t********************\n".format(end_time-start_time))
+    logging.info("\n********************\tEnd Time: {}\t********************".format(end_time))
+    logging.info("\n********************\tTOTAL TIME(s): {}\t********************".format(end_time-start_time))
 
     if args.save_model:
         torch.save(model.state_dict(), "mnist_cnn.pt")

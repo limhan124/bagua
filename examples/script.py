@@ -4,9 +4,9 @@ import subprocess
 examples_path = "/pub/ds3lab-scratch/limhan/bagua/examples/"
 datasets = ["cifar_10", "mnist"]
 gpu_available = ['1', '2', '3', '4', '5', '6', '7']
-gpu_num = [7, 6, 4, 2]
+gpu_num = [2]
 epoch_num = 150
-algorithms = ["signSGD", "gradient_allreduce"]
+algorithms = ["signSGD", "g_a_r_t"]
 lrs = [0.0001, 0.05]
 
 
@@ -39,17 +39,21 @@ def get_cmd():
 
 def main():
     for gpu in gpu_num:
-        export_gpu = "export CUDA_VISIBLE_DEVICES={}".format(",".join(gpu_available[:gpu]))
-        run_cmd(export_gpu)
+        # export_gpu = "export CUDA_VISIBLE_DEVICES={}".format(",".join(gpu_available[:gpu]))
+        # run_cmd(export_gpu)
         for dataset in datasets:
             path = examples_path + dataset
             for algo, lr in zip(algorithms, lrs):
-                if gpu == 7 and dataset == "cifar_10" and algo == "signSGD":
-                    continue
-                log_name = "logs/{}_{}_gpus_lr_{}_epoch_{}.txt".format(algo, gpu, lr, epoch_num)
-                cmd = "python3 -m bagua.distributed.launch --nproc_per_node={} main.py --algorithm {} --lr {} --epochs {} > {} 2>&1".format(
-                    gpu, algo, lr, epoch_num, log_name
-                )
+                if algo == "signSGD":
+                    log_name = "logs_cpp_rt/{}_{}_gpus_lr_{}_epoch_{}.txt".format(algo, gpu, lr, epoch_num)
+                    cmd = "python3 -m bagua.distributed.launch --nproc_per_node={} main.py --algorithm {} --lr {} --epochs {} --compress --record_time > {} 2>&1".format(
+                        gpu, algo, lr, epoch_num, log_name
+                    )
+                else:
+                    log_name = "logs_allreduce_rt/{}_{}_gpus_lr_{}_epoch_{}.txt".format(algo, gpu, lr, epoch_num)
+                    cmd = "python3 -m bagua.distributed.launch --nproc_per_node={} main.py --algorithm {} --lr {} --epochs {} --record_time > {} 2>&1".format(
+                        gpu, algo, lr, epoch_num, log_name
+                    )
                 run_experiment(cmd, path)
 
 
