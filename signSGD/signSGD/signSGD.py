@@ -235,7 +235,7 @@ class SignSGDAlgorithmImpl(AlgorithmImpl):
             import time
             if self.compress:
                 if self.print_memory_size:
-                    print("original_tensor_size", send_tensor_list.element_size() * send_tensor_list.nelement())
+                    print("original_tensor_size(bytes):", send_tensor_list.element_size() * send_tensor_list.nelement())
 
                 if self.record_time:
                     # compress send_tensor
@@ -266,16 +266,16 @@ class SignSGDAlgorithmImpl(AlgorithmImpl):
                     self.sign_momentum = self.compressor.majority_vote(self.recv_tensor_list, _size)
 
                 if self.print_memory_size:
-                    print("send_tensor_size", self.send_tensor.element_size() * self.send_tensor.nelement())
+                    print("send_tensor_size(bytes):", self.send_tensor.element_size() * self.send_tensor.nelement())
 
             else:
                 self.send_tensor.copy_(send_tensor_list)
                 if self.record_time:
                     start_time = time.time()
                     allgather(self.send_tensor, self.recv_tensor_list)
-                    self.sign_momentum = torch.sign(torch.sum(self.recv_tensor_list, 0)).float()
                     end_time = time.time()
                     self.optimizer.allgather_without_compressor_time += end_time - start_time
+                    self.sign_momentum = torch.sign(torch.sum(self.recv_tensor_list, 0)).float()
                 else:
                     allgather(self.send_tensor, self.recv_tensor_list)
                     self.sign_momentum = torch.sign(torch.sum(self.recv_tensor_list, 0)).float()
